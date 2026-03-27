@@ -8,6 +8,7 @@ Uses an ESP8266 (ESP-12F module) which connects to WiFi and publishes an MQTT ev
 
 - Requires Python 3.7, I recommend creating a virtual environment
 - [installation guide](https://github.com/espressif/ESP8266_RTOS_SDK)
+- Export the path to the ESP8266 SDK (e.g. `export IDF_PATH=/home/user/esp/ESP8266_RTOS_SDK`)
 
 There is a bug in the SDK that leads to ncurses library errors on Arch Linux, here's the [fix](https://gist.github.com/fiffy326/070dfd4e21a311140cdedc5dfc20c25e)
 
