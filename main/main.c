@@ -27,8 +27,9 @@
 
 #include "mqtt_client.h"
 
-// --- MQTT GLOBALS
+// --- MQTT GLOBALS ---
 
+// most config macros are set via the sdkmenu (`make menuconfig`)
 static const char *MQTT_TAG = "mqtt";
 
 #define MQTT_TOPIC_CONFIG \
@@ -82,6 +83,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *WIFI_TAG = "wifi";
 
 static int s_retry_num = 0;
+
 
 // --- WIFI FUNCTIONS ---
 
@@ -169,7 +171,7 @@ void wifi_init_sta(void)
 }
 
 
-// --- SENSOR FUNCTIONS ---
+// --- SENSOR ISR FUNCTION ---
 
 static void IRAM_ATTR sensor_isr_handler(void *arg)
 {
@@ -214,6 +216,11 @@ void app_main()
 
     wifi_init_sta();
 
+    // wifi modem will sleep in small intervals saving power, this works because we are only using station mode
+    // wifi_set_sleep_type(MODEM_SLEEP_T);
+
+
+    // -- MQTT CONFIG ---
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .uri = CONFIG_MQTT_BROKER_URL,
@@ -225,8 +232,10 @@ void app_main()
     // don't need event handler (see mqtt example for event handler)
     esp_mqtt_client_start(client);
 
-
     int msg_id = esp_mqtt_client_publish(client, CONFIG_MQTT_SENSOR_CONFIG_TOPIC, MQTT_TOPIC_CONFIG, 0, 1, 0);
+
+
+    // --- MAIN APP LOOP ---
 
     ESP_LOGI(SENSOR_TAG, "Activity sensor running...\n");
 
