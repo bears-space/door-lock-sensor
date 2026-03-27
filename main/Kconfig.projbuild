@@ -1,0 +1,58 @@
+menu "Door Lock Sensor Config"
+
+    config ESP_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            SSID (network name) for the example to connect to.
+
+    config ESP_WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi password (WPA or WPA2) for the example to use.
+
+    config ESP_WIFI_MAXIMUM_RETRY
+        int "Maximum retry"
+        default 5
+        help
+            Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
+
+    config MQTT_BROKER_URL
+        string "Mqtt Broker URL"
+        default "mqtt://10.0.0.3"
+        help
+            URL of the mqtt broker to connect to.
+
+    config MQTT_USERNAME
+        string "Mqtt Username"
+        default "user"
+        help
+            Username of the mqtt broker to connect to.
+
+    config MQTT_PASSWORD
+        string "Mqtt Password"
+        default "password"
+        help
+            Password of the mqtt broker to connect to.
+
+    config MQTT_SENSOR_CONFIG_TOPIC
+        string "Home Assistant Mqtt Sensor Configuration Topic"
+        default "homeassistant/binary_sensor/door_lock/config"
+        help
+            Mqtt topic for the home assistant sensor configuration.
+
+    config MQTT_SENSOR_TOPIC
+        string "Home Assistant Mqtt Sensor Topic"
+        default "bears/door_lock/state"
+        help
+            Mqtt topic for the home assistant sensor.
+
+    config DEBOUNCE_LIMIT_MS
+        string "Debounce Limit in milliseconds"
+        default "2000"
+        help
+            Debounce which limits the sensor to one mqtt publish every ... ms.
+
+
+endmenu
