@@ -56,7 +56,8 @@ static const char *MQTT_TAG = "mqtt";
 
 static const char *SENSOR_TAG = "sensor";
 
-static TaskHandle_t main_task_handle = NULL;
+static TaskHandle_t s_main_task_handle = NULL;
+static TaskHandle_t s_sync_task_handle = NULL;
 
 
 // --- WIFI GLOBALS ---
@@ -175,8 +176,27 @@ void wifi_init_sta(void)
 
 static void IRAM_ATTR sensor_isr_handler(void *arg)
 {
-    vTaskNotifyGiveFromISR(main_task_handle, NULL);
+    vTaskNotifyGiveFromISR(s_main_task_handle, NULL);
     portYIELD_FROM_ISR();
+}
+
+void debounce_sync_task(void *pvParameters) {
+
+    TickType_t sleep_time = pdMS_TO_TICKS(atoi(CONFIG_DEBOUNCE_LIMIT_MS) * 2);
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        while (1) {
+
+            uint32_t notified = ulTaskNotifyTake(pdTRUE, sleep_time);
+
+            if ( !notified ) {
+                xTaskNotifyGive(s_main_task_handle);
+                break;
+            }
+        }
+    }
 }
 
 void app_main()
@@ -203,7 +223,7 @@ void app_main()
     };
     gpio_config(&led_conf);
 
-    main_task_handle = xTaskGetCurrentTaskHandle();
+    s_main_task_handle = xTaskGetCurrentTaskHandle();
     gpio_set_level(LED_PIN, !gpio_get_level(SENSOR_PIN)); // set inital LED state
     gpio_install_isr_service(0);
     gpio_isr_handler_add(SENSOR_PIN, sensor_isr_handler, NULL);
@@ -220,7 +240,7 @@ void app_main()
     // wifi_set_sleep_type(MODEM_SLEEP_T);
 
 
-    // -- MQTT CONFIG ---
+    // --- MQTT CONFIG ---
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .uri = CONFIG_MQTT_BROKER_URL,
@@ -235,16 +255,34 @@ void app_main()
     int msg_id = esp_mqtt_client_publish(client, CONFIG_MQTT_SENSOR_CONFIG_TOPIC, MQTT_TOPIC_CONFIG, 0, 1, 0);
 
 
+    // --- DEBOUNCE CONFIG ---
+
+    xTaskCreate(
+        debounce_sync_task,
+        "debounce_sync",
+        2048,
+        NULL,
+        0,  // low prio idle task, should be preempted by main (prio 1)
+        &s_sync_task_handle
+    );
+
+
     // --- MAIN APP LOOP ---
 
     ESP_LOGI(SENSOR_TAG, "Activity sensor running...\n");
 
     TickType_t last_publish = xTaskGetTickCount();
+    int sensor_state = -1;
+    int sensor_state_old = -1;
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        int sensor_state = gpio_get_level(SENSOR_PIN);
+        sensor_state = gpio_get_level(SENSOR_PIN);
+        if (sensor_state == sensor_state_old)
+            continue;
+        else
+            sensor_state_old = sensor_state;
 
         gpio_set_level(LED_PIN, !sensor_state);
         ESP_LOGI(SENSOR_TAG, "sensor state -> %s\n", sensor_state == 0 ? "LOW (LED off)" : "HIGH (LED on)");
@@ -253,6 +291,9 @@ void app_main()
         uint32_t elapsed_ms = (xTaskGetTickCount() - last_publish) * portTICK_PERIOD_MS;
         if (elapsed_ms < atoi(CONFIG_DEBOUNCE_LIMIT_MS)) {
             ESP_LOGI(SENSOR_TAG, "Debounce limit reached, skipped mqtt publish");
+
+            // starts a sync timer which is 2 * CONFIG_DEBOUNCE_LIMIT_MS, to sync mqtt state after a debounce occured
+            xTaskNotifyGive(s_sync_task_handle);
             continue;
         }
 
