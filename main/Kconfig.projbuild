@@ -48,11 +48,23 @@ menu "Door Lock Sensor Config"
         help
             Mqtt topic for the home assistant sensor.
 
+    config MQTT_COFFEEBREAK_SENSOR_CONFIG_TOPIC
+        string "Home Assistant Coffee Break Sensor Configuration Topic"
+        default "homeassistant/binary_sensor/door_lock_coffeebrake/config"
+        help
+            Mqtt topic for the home assistant coffee break sensor configuration.
+
+    config MQTT_COFFEEBREAK_SENSOR_TOPIC
+        string "Home Assistant Coffee Break Sensor Topic"
+        default "bears/door_lock/coffeebrake/state"
+        help
+            Mqtt topic for the home assistant coffee break sensor.
+
     config DEBOUNCE_LIMIT_MS
         string "Debounce Limit in milliseconds"
         default "2000"
         help
-            Debounce which limits the sensor to one mqtt publish every ... ms.
+            The door sensor state must stay unchanged for this long before it is accepted.
 
 
 endmenu
