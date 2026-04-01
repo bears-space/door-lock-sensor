@@ -6,6 +6,8 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,12 +34,20 @@
 // most config macros are set via the sdkmenu (`make menuconfig`)
 static const char *MQTT_TAG = "mqtt";
 
+#define MQTT_SENSOR_AVAILABILITY_TOPIC CONFIG_MQTT_SENSOR_TOPIC "/availability"
+#define MQTT_QOS 1
+#define MQTT_RETAIN 1
+#define MQTT_KEEPALIVE_SECONDS 120
+
 #define MQTT_TOPIC_CONFIG \
     "{\n" \
     "  \"name\": \"Bears Door\",\n" \
     "  \"unique_id\": \"bears_door_lock_1\",\n" \
-    "  \"device_class\": \"door\",\n" \
+    "  \"device_class\": \"lock\",\n" \
     "  \"state_topic\": \"" CONFIG_MQTT_SENSOR_TOPIC "\",\n" \
+    "  \"availability_topic\": \"" MQTT_SENSOR_AVAILABILITY_TOPIC "\",\n" \
+    "  \"payload_available\": \"online\",\n" \
+    "  \"payload_not_available\": \"offline\",\n" \
     "  \"payload_on\": \"ON\",\n" \
     "  \"payload_off\": \"OFF\",\n" \
     "  \"device\": {\n" \
@@ -58,6 +68,9 @@ static const char *SENSOR_TAG = "sensor";
 
 static TaskHandle_t s_main_task_handle = NULL;
 static TaskHandle_t s_sync_task_handle = NULL;
+static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+static volatile bool s_mqtt_connected = false;
+static volatile bool s_force_state_sync = false;
 
 
 // --- WIFI GLOBALS ---
@@ -74,16 +87,131 @@ static TaskHandle_t s_sync_task_handle = NULL;
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
+/* The event group allows multiple bits for each event, but we only care about
+ * being connected to the AP with an IP. */
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
 
 
 static const char *WIFI_TAG = "wifi";
 
 static int s_retry_num = 0;
+
+static bool sensor_is_locked(int sensor_state)
+{
+    return sensor_state == 0;
+}
+
+static const char *sensor_state_to_mqtt_payload(int sensor_state)
+{
+    return sensor_is_locked(sensor_state) ? "OFF" : "ON";
+}
+
+static void publish_sensor_state(const char *reason)
+{
+    if (!s_mqtt_connected || s_mqtt_client == NULL) {
+        ESP_LOGW(MQTT_TAG, "Skipped state publish (%s), MQTT is disconnected", reason);
+        return;
+    }
+
+    int sensor_state = gpio_get_level(SENSOR_PIN);
+    const char *mqtt_sensor_state = sensor_state_to_mqtt_payload(sensor_state);
+    int msg_id = esp_mqtt_client_publish(
+        s_mqtt_client,
+        CONFIG_MQTT_SENSOR_TOPIC,
+        mqtt_sensor_state,
+        0,
+        MQTT_QOS,
+        MQTT_RETAIN
+    );
+
+    if (msg_id < 0) {
+        ESP_LOGW(MQTT_TAG, "State publish failed (%s)", reason);
+        return;
+    }
+
+    ESP_LOGI(
+        MQTT_TAG,
+        "Published lock state=%s (%s), msg_id=%d",
+        sensor_is_locked(sensor_state) ? "LOCKED" : "UNLOCKED",
+        reason,
+        msg_id
+    );
+}
+
+static void publish_mqtt_discovery(void)
+{
+    if (!s_mqtt_connected || s_mqtt_client == NULL) {
+        return;
+    }
+
+    int msg_id = esp_mqtt_client_publish(
+        s_mqtt_client,
+        CONFIG_MQTT_SENSOR_CONFIG_TOPIC,
+        MQTT_TOPIC_CONFIG,
+        0,
+        MQTT_QOS,
+        MQTT_RETAIN
+    );
+
+    if (msg_id < 0) {
+        ESP_LOGW(MQTT_TAG, "Discovery publish failed");
+        return;
+    }
+
+    ESP_LOGI(MQTT_TAG, "Published Home Assistant discovery config, msg_id=%d", msg_id);
+}
+
+static void publish_availability(const char *payload)
+{
+    if (!s_mqtt_connected || s_mqtt_client == NULL) {
+        return;
+    }
+
+    int msg_id = esp_mqtt_client_publish(
+        s_mqtt_client,
+        MQTT_SENSOR_AVAILABILITY_TOPIC,
+        payload,
+        0,
+        MQTT_QOS,
+        MQTT_RETAIN
+    );
+
+    if (msg_id < 0) {
+        ESP_LOGW(MQTT_TAG, "Availability publish failed");
+        return;
+    }
+
+    ESP_LOGI(MQTT_TAG, "Published availability=%s, msg_id=%d", payload, msg_id);
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    (void)handler_args;
+    (void)base;
+    (void)event_data;
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            s_mqtt_connected = true;
+            ESP_LOGI(MQTT_TAG, "MQTT connected");
+            publish_mqtt_discovery();
+            publish_availability("online");
+            publish_sensor_state("mqtt connected");
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            s_mqtt_connected = false;
+            ESP_LOGW(MQTT_TAG, "MQTT disconnected");
+            break;
+
+        case MQTT_EVENT_ERROR:
+            ESP_LOGW(MQTT_TAG, "MQTT error event received");
+            break;
+
+        default:
+            break;
+    }
+}
 
 
 // --- WIFI FUNCTIONS ---
@@ -94,14 +222,17 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
         if (s_retry_num < EXAMPLE_ESP_WIFI_MAXIMUM_RETRY) {
-            esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(WIFI_TAG, "retry to connect to the AP");
+            ESP_LOGW(WIFI_TAG, "disconnected from AP, retry %d/%d", s_retry_num, EXAMPLE_ESP_WIFI_MAXIMUM_RETRY);
         } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            s_retry_num++;
+            ESP_LOGW(WIFI_TAG, "disconnected from AP, retry %d (continuing to reconnect)", s_retry_num);
         }
-        ESP_LOGI(WIFI_TAG,"connect to the AP fail");
+
+        esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(WIFI_TAG, "got ip:%s",
@@ -146,29 +277,20 @@ void wifi_init_sta(void)
 
     ESP_LOGI(WIFI_TAG, "wifi_init_sta finished.");
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    /* Wait for the first successful connection. After that the event handlers stay
+     * registered so the station keeps reconnecting on future outages. */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            WIFI_CONNECTED_BIT,
             pdFALSE,
-            pdFALSE,
+            pdTRUE,
             portMAX_DELAY);
 
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(WIFI_TAG, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(WIFI_TAG, "Failed to connect to SSID:%s, password:%s",
                  EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
     } else {
         ESP_LOGE(WIFI_TAG, "UNEXPECTED EVENT");
     }
-
-    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
-    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
-    vEventGroupDelete(s_wifi_event_group);
 }
 
 
@@ -182,7 +304,7 @@ static void IRAM_ATTR sensor_isr_handler(void *arg)
 
 void debounce_sync_task(void *pvParameters) {
 
-    TickType_t sleep_time = pdMS_TO_TICKS(atoi(CONFIG_DEBOUNCE_LIMIT_MS) * 2);
+    TickType_t sleep_time = pdMS_TO_TICKS(atoi(CONFIG_DEBOUNCE_LIMIT_MS));
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -242,17 +364,23 @@ void app_main()
 
     // --- MQTT CONFIG ---
 
+    const uint32_t debounce_limit_ms = (uint32_t)atoi(CONFIG_DEBOUNCE_LIMIT_MS);
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .uri = CONFIG_MQTT_BROKER_URL,
+        .keepalive = MQTT_KEEPALIVE_SECONDS,
         .username = CONFIG_MQTT_USERNAME,
-        .password = CONFIG_MQTT_PASSWORD
+        .password = CONFIG_MQTT_PASSWORD,
+        .disable_auto_reconnect = false,
+        .lwt_topic = MQTT_SENSOR_AVAILABILITY_TOPIC,
+        .lwt_msg = "offline",
+        .lwt_qos = MQTT_QOS,
+        .lwt_retain = MQTT_RETAIN
     };
 
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    // don't need event handler (see mqtt example for event handler)
-    esp_mqtt_client_start(client);
-
-    int msg_id = esp_mqtt_client_publish(client, CONFIG_MQTT_SENSOR_CONFIG_TOPIC, MQTT_TOPIC_CONFIG, 0, 1, 0);
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
 
 
     // --- DEBOUNCE CONFIG ---
@@ -272,37 +400,41 @@ void app_main()
     ESP_LOGI(SENSOR_TAG, "Activity sensor running...\n");
 
     TickType_t last_publish = xTaskGetTickCount();
-    int sensor_state = -1;
-    int sensor_state_old = -1;
+    int sensor_state = gpio_get_level(SENSOR_PIN);
+    int sensor_state_old = sensor_state;
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        bool force_publish = s_force_state_sync;
         sensor_state = gpio_get_level(SENSOR_PIN);
-        if (sensor_state == sensor_state_old)
+        if (sensor_state == sensor_state_old && !force_publish)
             continue;
         else
             sensor_state_old = sensor_state;
 
         gpio_set_level(LED_PIN, !sensor_state);
-        ESP_LOGI(SENSOR_TAG, "sensor state -> %s\n", sensor_state == 0 ? "LOW (LED off)" : "HIGH (LED on)");
+        ESP_LOGI(
+            SENSOR_TAG,
+            "sensor raw=%s, lock=%s",
+            sensor_state == 0 ? "LOW" : "HIGH",
+            sensor_is_locked(sensor_state) ? "LOCKED" : "UNLOCKED"
+        );
 
         // debounce to avoid spamming mqtt on sensor jitter
         uint32_t elapsed_ms = (xTaskGetTickCount() - last_publish) * portTICK_PERIOD_MS;
-        if (elapsed_ms < atoi(CONFIG_DEBOUNCE_LIMIT_MS)) {
+        if (!force_publish && elapsed_ms < debounce_limit_ms) {
             ESP_LOGI(SENSOR_TAG, "Debounce limit reached, skipped mqtt publish");
 
-            // starts a sync timer which is 2 * CONFIG_DEBOUNCE_LIMIT_MS, to sync mqtt state after a debounce occured
+            // start a quiet-period timer so the final stable state is published after debounce
+            s_force_state_sync = true;
             xTaskNotifyGive(s_sync_task_handle);
             continue;
         }
 
-        char *mqtt_sensor_state;
-        mqtt_sensor_state = sensor_state == 0 ? "ON" : "OFF"; // the sensor being low means the door is closed -> the door lock is on
-
-        msg_id = esp_mqtt_client_publish(client, CONFIG_MQTT_SENSOR_TOPIC, mqtt_sensor_state, 0, 1, 0);
-        ESP_LOGI(MQTT_TAG, "Sent publish successful, msg_id=%d", msg_id);
+        publish_sensor_state(force_publish ? "debounce resync" : "state change");
         last_publish = xTaskGetTickCount();
+        s_force_state_sync = false;
     }
 
 }
